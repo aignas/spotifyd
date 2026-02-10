@@ -1,22 +1,4 @@
-use std::{
-    error::Error as StdError,
-    fmt::{self, Display},
-};
-
-#[derive(Clone, Debug)]
-pub struct ParseError(String);
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "failed to parse config entry: {}", self.0)
-    }
-}
-
-impl StdError for ParseError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        None
-    }
-}
+use std::fmt::{self, Display};
 
 /// This crate's error type.
 #[derive(Debug)]
@@ -89,17 +71,13 @@ impl Display for ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ErrorKind::Subprocess { cmd, msg, shell } => match msg {
-                Message::None => write!(f, "Failed to execute {:?} using {:?}.", cmd, shell),
-                Message::Error(ref e) => write!(
-                    f,
-                    "Failed to execute {:?} using {:?}. Error: {}",
-                    cmd, shell, e
-                ),
-                Message::String(ref s) => write!(
-                    f,
-                    "Failed to execute {:?} using {:?}. Error: {}",
-                    cmd, shell, s
-                ),
+                Message::None => write!(f, "Failed to execute {cmd} using {shell}."),
+                Message::Error(e) => {
+                    write!(f, "Failed to execute {cmd} using {shell}. Error: {e}",)
+                }
+                Message::String(s) => {
+                    write!(f, "Failed to execute {cmd} using {shell}. Error: {s}",)
+                }
             },
             ErrorKind::NormalisationPregainInvalid => write!(
                 f,

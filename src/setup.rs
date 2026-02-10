@@ -1,189 +1,166 @@
 #[cfg(feature = "alsa_backend")]
 use crate::alsa_mixer;
-use crate::{config, main_loop};
-use futures::{self, Future};
-#[cfg(feature = "dbus_keyring")]
-use keyring::Keyring;
-use librespot::{
-    connect::discovery::discovery,
-    core::{
-        authentication::get_credentials,
-        cache::Cache,
-        config::{ConnectConfig, DeviceType, VolumeCtrl},
-        session::Session,
-    },
-    playback::{
-        audio_backend::{Sink, BACKENDS},
-        mixer::{self, Mixer},
-    },
+use crate::{
+    config,
+    main_loop::{self, CredentialsProvider},
+    utils::Backoff,
 };
-use log::{error, info};
-use std::str::FromStr;
-use std::{io, process::exit};
-use tokio_core::reactor::Handle;
-use tokio_signal::ctrl_c;
+use color_eyre::{Section, eyre::eyre};
+use futures::StreamExt as _;
+use librespot_playback::{
+    audio_backend::{self},
+    mixer::{self, Mixer, MixerConfig},
+};
+use log::{debug, error, info};
+use std::{sync::Arc, thread};
 
 pub(crate) fn initial_state(
-    handle: Handle,
     config: config::SpotifydConfig,
-) -> main_loop::MainLoopState {
-    #[cfg(feature = "alsa_backend")]
-    let mut mixer = {
-        let local_audio_device = config.audio_device.clone();
-        let local_control_device = config.control_device.clone();
-        let local_mixer = config.mixer.clone();
+) -> color_eyre::Result<main_loop::MainLoop> {
+    let mixer: Arc<dyn Mixer> = {
         match config.volume_controller {
-            config::VolumeController::SoftVolume => {
-                info!("Using software volume controller.");
-                Box::new(|| Box::new(mixer::softmixer::SoftMixer::open(None)) as Box<dyn Mixer>)
-                    as Box<dyn FnMut() -> Box<dyn Mixer>>
+            config::VolumeController::None => {
+                info!("Using no volume controller.");
+                Arc::new(crate::no_mixer::NoMixer)
             }
-            _ => {
+            #[cfg(feature = "alsa_backend")]
+            config::VolumeController::Alsa | config::VolumeController::AlsaLinear => {
+                let device = config
+                    .alsa_config
+                    .mixer
+                    .as_deref()
+                    .or(config.audio_device.as_deref())
+                    .unwrap_or("default")
+                    .to_string();
+                let control = config
+                    .alsa_config
+                    .control
+                    .as_deref()
+                    .unwrap_or("Master")
+                    .to_string();
                 info!("Using alsa volume controller.");
-                let linear = matches!(
+                use librespot_playback::config::VolumeCtrl;
+                let volume_ctrl = if matches!(
                     config.volume_controller,
                     config::VolumeController::AlsaLinear
-                );
-                Box::new(move || {
-                    Box::new(alsa_mixer::AlsaMixer {
-                        device: local_control_device
-                            .clone()
-                            .or_else(|| local_audio_device.clone())
-                            .unwrap_or_else(|| "default".to_string()),
-                        mixer: local_mixer.clone().unwrap_or_else(|| "Master".to_string()),
-                        linear_scaling: linear,
-                    }) as Box<dyn mixer::Mixer>
-                }) as Box<dyn FnMut() -> Box<dyn Mixer>>
+                ) {
+                    VolumeCtrl::Linear
+                } else {
+                    VolumeCtrl::Log(0.0) /* this value is ignored */
+                };
+                Arc::new(alsa_mixer::AlsaMixer::open(MixerConfig {
+                    device,
+                    control,
+                    index: 0,
+                    volume_ctrl,
+                }).with_suggestion(|| {
+                    match alsa_mixer::get_available_controls() {
+                        Err(err) => format!("there are no controls available, maybe check that alsa is available: {err}"),
+                        Ok(controls) => {
+                            format!("maybe try one of the following as 'mixer':{}", controls.filter_map(|hint| hint.name.map(|name| format!("\n- {name}"))).collect::<String>())
+                        }
+                    }
+                })?)
+            }
+            _ => {
+                info!("Using software volume controller.");
+                let mixer = mixer::softmixer::SoftMixer::open(MixerConfig::default())
+                    .expect("SoftMixer::open never returns an Error");
+                Arc::new(mixer)
             }
         }
     };
 
-    #[cfg(not(feature = "alsa_backend"))]
-    let mut mixer = {
-        info!("Using software volume controller.");
-        Box::new(|| Box::new(mixer::softmixer::SoftMixer::open(None)) as Box<dyn Mixer>)
-            as Box<dyn FnMut() -> Box<dyn Mixer>>
-    };
-
-    let cache = config.cache;
     let player_config = config.player_config;
     let session_config = config.session_config;
     let backend = config.backend.clone();
-    let autoplay = config.autoplay;
-    let device_id = session_config.device_id.clone();
-
-    #[cfg(feature = "alsa_backend")]
-    let volume_ctrl = if matches!(
-        config.volume_controller,
-        config::VolumeController::AlsaLinear
-    ) {
-        VolumeCtrl::Linear
-    } else {
-        VolumeCtrl::default()
-    };
-
-    #[cfg(not(feature = "alsa_backend"))]
-    let volume_ctrl = VolumeCtrl::default();
 
     let zeroconf_port = config.zeroconf_port.unwrap_or(0);
 
-    let device_type: DeviceType = DeviceType::from_str(&config.device_type).unwrap_or_default();
-
-    #[allow(clippy::or_fun_call)]
-    let discovery_stream = discovery(
-        &handle,
-        ConnectConfig {
-            autoplay,
-            name: config.device_name.clone(),
-            device_type,
-            volume: mixer().volume(),
-            volume_ctrl: volume_ctrl.clone(),
-        },
-        device_id,
-        zeroconf_port,
-    )
-    .unwrap();
-
-    let username = config.username;
-    #[allow(unused_mut)] // mut is needed behind the dbus_keyring flag.
-    let mut password = config.password;
-    #[cfg(feature = "dbus_keyring")]
-    {
-        // We only need to check if an actual user has been specified as
-        // spotifyd can run without being signed in too.
-        if username.is_some() && config.use_keyring {
-            info!("Checking keyring for password");
-            let keyring = Keyring::new("spotifyd", username.as_ref().unwrap());
-            let retrieved_password = keyring.get_password();
-            password = password.or_else(|| retrieved_password.ok());
-        }
-    }
-
-    let connection = if let Some(credentials) = get_credentials(
-        username,
-        password,
-        cache.as_ref().and_then(Cache::credentials),
-        |_| {
-            error!("No password found.");
-            exit(1);
-        },
-    ) {
-        Session::connect(
-            session_config.clone(),
-            credentials,
-            cache.clone(),
-            handle.clone(),
-        )
+    let creds = if let Some(creds) = config.oauth_cache.as_ref().and_then(|c| c.credentials()) {
+        info!(
+            "Login via OAuth as user {}.",
+            creds.username.as_deref().unwrap_or("unknown")
+        );
+        Some(creds)
+    } else if let Some(creds) = config.cache.as_ref().and_then(|c| c.credentials()) {
+        info!(
+            "Restoring previous login as user {}.",
+            creds.username.as_deref().unwrap_or("unknown")
+        );
+        Some(creds)
     } else {
-        Box::new(futures::future::empty())
-            as Box<dyn futures::Future<Item = Session, Error = io::Error>>
+        None
     };
 
-    let backend = find_backend(backend.as_ref().map(String::as_ref));
-    main_loop::MainLoopState {
-        librespot_connection: main_loop::LibreSpotConnection::new(connection, discovery_stream),
-        audio_setup: main_loop::AudioSetup {
-            mixer,
-            backend,
-            audio_device: config.audio_device.clone(),
-        },
-        spotifyd_state: main_loop::SpotifydState {
-            ctrl_c_stream: Box::new(ctrl_c(&handle).flatten_stream()),
-            shutting_down: false,
-            cache,
-            device_name: config.device_name,
-            player_event_channel: None,
-            player_event_program: config.onevent,
-            dbus_mpris_server: None,
-        },
-        player_config,
-        session_config,
-        handle,
-        initial_volume: config.initial_volume,
-        volume_ctrl,
-        running_event_program: None,
-        shell: config.shell,
-        device_type,
-        autoplay,
-        use_mpris: config.use_mpris,
-    }
-}
+    let discovery = if config.discovery {
+        info!("Starting zeroconf server to advertise on local network.");
+        debug!("Using device id '{}'", session_config.device_id);
+        let mut retry_backoff = Backoff::default();
+        loop {
+            match librespot_discovery::Discovery::builder(
+                session_config.device_id.clone(),
+                session_config.client_id.clone(),
+            )
+            .name(config.device_name.clone())
+            .device_type(config.device_type)
+            .port(zeroconf_port)
+            .launch()
+            {
+                Ok(discovery_stream) => break Some(discovery_stream),
+                Err(err) => {
+                    error!("failed to enable discovery: {err}");
+                    let Ok(backoff) = retry_backoff.next_backoff() else {
+                        error!("maximum amount of retries exceeded");
+                        break None;
+                    };
+                    info!("retrying discovery in {} seconds", backoff.as_secs());
+                    thread::sleep(backoff);
+                    info!(
+                        "trying to enable discovery (retry {}/{})",
+                        retry_backoff.retries(),
+                        retry_backoff.max_retries()
+                    );
+                }
+            }
+        }
+    } else {
+        None
+    };
 
-fn find_backend(name: Option<&str>) -> fn(Option<String>) -> Box<dyn Sink> {
-    match name {
-        Some(name) => {
-            BACKENDS
-                .iter()
-                .find(|backend| name == backend.0)
-                .unwrap_or_else(|| panic!("Unknown backend: {}.", name))
-                .1
+    let credentials_provider = match (discovery, creds) {
+        (Some(stream), creds) => CredentialsProvider::Discovery {
+            stream: stream.peekable(),
+            last_credentials: creds,
+        },
+        (None, Some(creds)) => CredentialsProvider::CredentialsOnly(creds),
+        (None, None) => {
+            return Err(
+                eyre!("Discovery unavailable and no credentials found.").with_suggestion(
+                    || "Try enabling discovery or logging in first with `spotifyd authenticate`.",
+                ),
+            );
         }
-        None => {
-            let &(name, back) = BACKENDS
-                .first()
-                .expect("No backends were enabled at build time");
-            info!("No backend specified, defaulting to: {}.", name);
-            back
-        }
-    }
+    };
+
+    let backend = audio_backend::find(backend).expect("available backends should match ours");
+
+    Ok(main_loop::MainLoop {
+        credentials_provider,
+        mixer,
+        session_config,
+        cache: config.cache,
+        audio_device: config.audio_device,
+        audio_format: config.audio_format,
+        player_config,
+        backend,
+        initial_volume: config.initial_volume,
+        disable_volume: false,
+        shell: config.shell,
+        device_type: config.device_type,
+        device_name: config.device_name,
+        player_event_program: config.onevent,
+        #[cfg(feature = "dbus_mpris")]
+        mpris_config: config.mpris,
+    })
 }
